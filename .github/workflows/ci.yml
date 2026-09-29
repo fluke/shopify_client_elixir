@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported
+          - elixir: '1.15.8'
+            otp: '26.2'
+          # Current (keep in sync with mise.toml)
+          - elixir: '1.20.4'
+            otp: '29.1.1'
+            lint: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-${{ hashFiles('mix.lock') }}
+
+      - run: mix deps.get
+      - run: mix deps.unlock --check-unused
+        if: matrix.lint
+      - run: mix format --check-formatted
+        if: matrix.lint
+      - run: mix compile --warnings-as-errors
+        if: matrix.lint
+      - run: mix test
