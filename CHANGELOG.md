@@ -4,7 +4,7 @@
 
 First version.
 
-- `ShopifyClient.new/1` and `attach/2`: a Req-based client for the Shopify GraphQL Admin API. The API version is required, requests only go to `*.myshopify.com`, and the access token is kept out of `inspect/1`.
+- `ShopifyClient.new/1`: an opaque client for the Shopify GraphQL Admin API. HTTP (Req) is an implementation detail, customizable through `:req_options` and `update_req/2`. The API version is required, requests only go to `*.myshopify.com`, and `inspect/1` shows only the shop and API version, never the token.
 - `ShopifyClient.query/4` and `query!/4`: responses carry the parsed cost, and every failure is normalized into `ShopifyClient.Error`, including mutation `userErrors`.
 - A per-shop cost budget (`ShopifyClient.Budget`), checked before each request, with a `:wait` or `:fail_fast` throttle policy.
 - `ShopifyClient.stream/4`: cursor pagination as a lazy `Stream`.

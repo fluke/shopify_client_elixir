@@ -3,7 +3,7 @@ defmodule ShopifyClientTest do
 
   import ExUnit.CaptureLog
 
-  describe "new/1 and attach/2" do
+  describe "new/1" do
     test "posts to the shop's versioned GraphQL endpoint with the token and a user-agent" do
       Req.Test.stub(__MODULE__, fn conn ->
         assert conn.method == "POST"
@@ -54,17 +54,58 @@ defmodule ShopifyClientTest do
       end
     end
 
-    test "attach/2 keeps the Req options it's given" do
-      client =
-        Req.new(receive_timeout: 1_234, plug: {Req.Test, __MODULE__})
-        |> ShopifyClient.attach(shop: "example", access_token: "t", api_version: "unstable")
-
-      assert client.options.receive_timeout == 1_234
-      assert ShopifyClient.shop(client) == "example.myshopify.com"
+    test "inspect/1 shows only the shop and API version" do
+      client = client(__MODULE__, shop: "example")
+      assert inspect(client) == "#ShopifyClient<example.myshopify.com 2026-04>"
     end
 
-    test "query/4 on a plain Req request explains itself" do
-      assert_raise ArgumentError, ~r/not a ShopifyClient client/, fn ->
+    test "exposes the shop and API version" do
+      client = client(__MODULE__, shop: "example", api_version: "unstable")
+      assert ShopifyClient.shop(client) == "example.myshopify.com"
+      assert ShopifyClient.api_version(client) == "unstable"
+    end
+
+    test ":req_options reach the HTTP layer" do
+      Req.Test.stub(__MODULE__, fn conn ->
+        assert Plug.Conn.get_req_header(conn, "x-extra") == ["yes"]
+        Req.Test.json(conn, Shopify.data(%{"a" => 1}))
+      end)
+
+      client =
+        client(__MODULE__,
+          req_options: [plug: {Req.Test, __MODULE__}, headers: [{"x-extra", "yes"}]]
+        )
+
+      assert {:ok, _response} = ShopifyClient.query(client, "{ a }")
+    end
+
+    test "update_req/2 steps run on every request" do
+      test_pid = self()
+      Req.Test.stub(__MODULE__, &Req.Test.json(&1, Shopify.data(%{"a" => 1})))
+
+      client =
+        client(__MODULE__)
+        |> ShopifyClient.update_req(fn req ->
+          Req.Request.append_request_steps(req,
+            trace: fn request ->
+              send(test_pid, :traced)
+              request
+            end
+          )
+        end)
+
+      ShopifyClient.query(client, "{ a }")
+      assert_received :traced
+    end
+
+    test "update_req/2 must return a Req request" do
+      assert_raise ArgumentError, ~r/expects a Req.Request back/, fn ->
+        ShopifyClient.update_req(client(__MODULE__), fn _req -> :oops end)
+      end
+    end
+
+    test "query/4 with something other than a client explains itself" do
+      assert_raise ArgumentError, ~r/expected a client from ShopifyClient.new\/1/, fn ->
         ShopifyClient.query(Req.new(), "{ shop { name } }")
       end
     end
@@ -176,8 +217,7 @@ defmodule ShopifyClientTest do
     test "a transport error is reported, not retried" do
       Req.Test.expect(__MODULE__, &Req.Test.transport_error(&1, :econnrefused))
 
-      assert {:error,
-              %Error{reason: :transport, details: %Req.TransportError{reason: :econnrefused}}} =
+      assert {:error, %Error{reason: :transport, details: :econnrefused}} =
                ShopifyClient.query(client(__MODULE__), "mutation { a }")
     end
 

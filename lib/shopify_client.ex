@@ -74,9 +74,20 @@ defmodule ShopifyClient do
       {:ok, %ShopifyClient.Response{data: data}} =
         ShopifyClient.query(client, "query { shop { name } }")
 
-  A client is a plain `%Req.Request{}`, so every Req option and step still
-  applies (`ShopifyClient.new(req_options: [receive_timeout: 5_000])`, or
-  `Req.new(...) |> ShopifyClient.attach(...)`).
+  A client is an opaque `%ShopifyClient{}`: pass it to `query/4`,
+  `stream/4` and `ShopifyClient.Bulk`, and don't rely on its fields.
+
+  ## Customization
+
+  HTTP is handled by [Req](https://hexdocs.pm/req), as an implementation
+  detail. Its options (timeouts, proxies, a `Req.Test` plug in tests) go in
+  `:req_options`:
+
+      ShopifyClient.new(shop: ..., access_token: ..., api_version: "2026-04",
+                        req_options: [receive_timeout: 5_000])
+
+  To go further, such as adding a Req step or plugin for tracing, use
+  `update_req/2`.
 
   ## Throttling
 
@@ -120,36 +131,68 @@ defmodule ShopifyClient do
   @operation_name ~r/\A\s*(?:query|mutation|subscription)\s+([_A-Za-z][_0-9A-Za-z]*)/
   @version Mix.Project.config()[:version]
 
-  @type client :: Req.Request.t()
+  # Opaque: callers use the functions in this module, never the fields, so
+  # the HTTP layer (Req) can change without breaking anyone.
+  @enforce_keys [:shop, :api_version, :req, :query_opts]
+  defstruct [:shop, :api_version, :req, :query_opts]
+
+  @opaque t :: %__MODULE__{
+            shop: String.t(),
+            api_version: String.t(),
+            req: Req.Request.t(),
+            query_opts: keyword()
+          }
+
+  @typedoc "A client, from `new/1`."
+  @type client :: t()
 
   @doc """
   Builds a client. See the options in the module docs; the throttle and
   `:user_errors` options become the defaults for every `query/4` on it.
   """
-  @spec new(keyword()) :: client()
+  @spec new(keyword()) :: t()
   def new(opts) do
-    {req_options, opts} = Keyword.pop(opts, :req_options, [])
-    req_options |> Req.new() |> attach(opts)
-  end
-
-  @doc "Attaches the Shopify GraphQL client to an existing `Req.Request`."
-  @spec attach(Req.Request.t(), keyword()) :: client()
-  def attach(%Req.Request{} = request, opts) do
     opts = NimbleOptions.validate!(opts, @client_schema)
     shop = normalize_shop!(opts[:shop])
     api_version = validate_api_version!(opts[:api_version])
-    token = opts[:access_token]
 
-    config = %{
+    %__MODULE__{
       shop: shop,
       api_version: api_version,
-      # A closure, so `inspect/1` of the client (in logs, crash reports) shows
-      # `#Function<...>` instead of the token. Req only redacts `authorization`.
-      token: fn -> token end,
+      req: build_req(shop, api_version, opts),
       query_opts: Keyword.take(opts, @query_option_keys)
     }
+  end
 
-    request
+  @doc """
+  Customizes the underlying `Req.Request` beyond what `:req_options` covers,
+  for example to add a Req step or plugin (tracing, logging). `fun` receives
+  the request and must return one.
+
+      ShopifyClient.update_req(client, fn req ->
+        Req.Request.append_request_steps(req, trace: &MyApp.Tracing.tag/1)
+      end)
+
+  Overriding the client's own settings (the URL, the access token header,
+  `retry: false`) is unsupported: re-enabling Req's retries, for instance,
+  could resend a mutation that already ran.
+  """
+  @spec update_req(t(), (Req.Request.t() -> Req.Request.t())) :: t()
+  def update_req(%__MODULE__{req: req} = client, fun) when is_function(fun, 1) do
+    case fun.(req) do
+      %Req.Request{} = req ->
+        %{client | req: req}
+
+      other ->
+        raise ArgumentError, "update_req/2 expects a Req.Request back, got: #{inspect(other)}"
+    end
+  end
+
+  defp build_req(shop, api_version, opts) do
+    token = opts[:access_token]
+
+    opts[:req_options]
+    |> Req.new()
     |> Req.merge(
       method: :post,
       base_url: "https://#{shop}/admin/api/#{api_version}",
@@ -159,7 +202,9 @@ defmodule ShopifyClient do
       retry: false
     )
     |> Req.Request.put_header("user-agent", user_agent(opts[:app_name]))
-    |> Req.Request.put_private(:shopify_client, config)
+    # The token lives in a closure, added as a header only at send time, so
+    # inspecting the request (Req only redacts `authorization`) never shows it.
+    |> Req.Request.put_private(:shopify_client_token, fn -> token end)
     |> Req.Request.prepend_request_steps(shopify_client_token: &put_token/1)
   end
 
@@ -169,23 +214,29 @@ defmodule ShopifyClient do
   Returns `{:ok, %ShopifyClient.Response{}}` or `{:error, %ShopifyClient.Error{}}`.
   `opts` override the client's throttle and `:user_errors` options for this call.
   """
-  @spec query(client(), String.t(), map(), keyword()) ::
+  @spec query(t(), String.t(), map(), keyword()) ::
           {:ok, Response.t()} | {:error, Error.t()}
-  def query(%Req.Request{} = client, query, variables \\ %{}, opts \\ [])
+  def query(client, query, variables \\ %{}, opts \\ [])
+
+  def query(%__MODULE__{} = client, query, variables, opts)
       when is_binary(query) and is_map(variables) do
-    config = fetch_config!(client)
-    opts = NimbleOptions.validate!(Keyword.merge(config.query_opts, opts), @query_schema)
+    opts = NimbleOptions.validate!(Keyword.merge(client.query_opts, opts), @query_schema)
 
     metadata = %{
-      shop: config.shop,
-      api_version: config.api_version,
+      shop: client.shop,
+      api_version: client.api_version,
       operation: operation_name(query)
     }
 
     :telemetry.span([:shopify_client, :query], metadata, fn ->
-      result = run(client, config.shop, %{query: query, variables: variables}, opts, 0)
+      result = run(client, client.shop, %{query: query, variables: variables}, opts, 0)
       {result, Map.merge(metadata, result_metadata(result))}
     end)
+  end
+
+  def query(other, _query, _variables, _opts) when not is_struct(other, __MODULE__) do
+    raise ArgumentError,
+          "expected a client from ShopifyClient.new/1, got: #{inspect(other, limit: 3)}"
   end
 
   @doc "Like `query/4`, but returns the response or raises `ShopifyClient.Error`."
@@ -204,8 +255,17 @@ defmodule ShopifyClient do
   defdelegate stream(client, query, variables \\ %{}, opts), to: ShopifyClient.Pagination
 
   @doc "The shop (myshopify.com domain) a client talks to."
-  @spec shop(client()) :: String.t()
-  def shop(client), do: fetch_config!(client).shop
+  @spec shop(t()) :: String.t()
+  def shop(%__MODULE__{shop: shop}), do: shop
+
+  @doc "The Admin API version a client uses."
+  @spec api_version(t()) :: String.t()
+  def api_version(%__MODULE__{api_version: api_version}), do: api_version
+
+  # For ShopifyClient.Bulk: the adapter settings (connection pool, test plug)
+  # a separate request should reuse, without the Shopify URL or token.
+  @doc false
+  def __adapter_options__(%__MODULE__{req: req}, keys), do: Map.take(req.options, keys)
 
   # -- running a request ----------------------------------------------------------
 
@@ -265,8 +325,8 @@ defmodule ShopifyClient do
     end
   end
 
-  defp send_request(client, shop, body, opts) do
-    case Req.request(client, json: body) do
+  defp send_request(%__MODULE__{req: req}, shop, body, opts) do
+    case Req.request(req, json: body) do
       {:ok, response} ->
         cost = Cost.from_body(response.body)
         Budget.record(shop, cost)
@@ -274,8 +334,14 @@ defmodule ShopifyClient do
         handle_response(response, cost, opts)
 
       {:error, exception} ->
+        # The plain reason (:econnrefused, :timeout, ...), not Req's exception
+        # struct, so no Req type leaks into the public API.
         {:error,
-         %Error{reason: :transport, details: exception, message: Exception.message(exception)}}
+         %Error{
+           reason: :transport,
+           details: Map.get(exception, :reason, exception),
+           message: Exception.message(exception)
+         }}
     end
   end
 
@@ -376,15 +442,8 @@ defmodule ShopifyClient do
   # -- helpers ------------------------------------------------------------------------
 
   defp put_token(request) do
-    %{token: token} = request.private.shopify_client
+    token = Req.Request.get_private(request, :shopify_client_token)
     Req.Request.put_header(request, "x-shopify-access-token", token.())
-  end
-
-  defp fetch_config!(%Req.Request{private: %{shopify_client: config}}), do: config
-
-  defp fetch_config!(%Req.Request{}) do
-    raise ArgumentError,
-          "not a ShopifyClient client: build one with ShopifyClient.new/1 or ShopifyClient.attach/2"
   end
 
   @doc false

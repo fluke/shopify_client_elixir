@@ -207,8 +207,8 @@ defmodule ShopifyClient.Bulk do
   defp download_chunks(url, client) do
     Stream.flat_map([url], fn url ->
       options =
-        client.options
-        |> Map.take(@adapter_options)
+        client
+        |> ShopifyClient.__adapter_options__(@adapter_options)
         |> Map.to_list()
         |> Keyword.merge(url: url, into: :self)
 

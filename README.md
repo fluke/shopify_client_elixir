@@ -1,8 +1,8 @@
 # ShopifyClient
 
-A client for Shopify's **GraphQL Admin API**, for Elixir. It's built on
-[Req](https://hexdocs.pm/req), so everything Req does (adapters, `Req.Test`,
-telemetry) still applies.
+A client for Shopify's **GraphQL Admin API**, for Elixir. HTTP is handled by
+[Req](https://hexdocs.pm/req) under the hood: you never have to touch it,
+but its options are there when you need them.
 
 GraphQL-only, by design: Shopify's REST Admin API is legacy. There's no
 OAuth, sessions or webhook plumbing either. This library talks to the API,
@@ -120,9 +120,22 @@ client
 At scale, skip polling: subscribe to the `bulk_operations/finish` webhook,
 then use `ShopifyClient.Bulk.webhook_operation_id/1` and `ShopifyClient.Bulk.get/3`.
 
+### Customization
+
+Req options (timeouts, proxies, a test plug) go in `:req_options`. For
+anything more, such as a tracing or logging step, use `update_req/2`:
+
+```elixir
+client =
+  ShopifyClient.new(shop: ..., access_token: ..., api_version: "2026-04",
+                    req_options: [receive_timeout: 5_000])
+
+client = ShopifyClient.update_req(client, &Req.Request.append_request_steps(&1, trace: &MyApp.trace/1))
+```
+
 ### Testing
 
-Clients are `Req` requests, so `Req.Test` works as usual.
+Point the client at a `Req.Test` stub with `req_options: [plug: {Req.Test, MyApp.Shopify}]`.
 `ShopifyClient.Test` builds Shopify-shaped bodies:
 
 ```elixir
