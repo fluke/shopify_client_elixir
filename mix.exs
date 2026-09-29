@@ -2,7 +2,7 @@ defmodule ShopifyClient.MixProject do
   use Mix.Project
 
   @version "0.1.0"
-  @source_url "https://github.com/fluke/shopify_client"
+  @source_url "https://github.com/fluke/shopify_client_elixir"
 
   def project do
     [

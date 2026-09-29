@@ -31,7 +31,7 @@ What it does, beyond sending a query:
 ```elixir
 def deps do
   [
-    {:shopify_client, github: "fluke/shopify_client"}
+    {:shopify_client, github: "fluke/shopify_client_elixir"}
   ]
 end
 ```
