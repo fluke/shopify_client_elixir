@@ -15,6 +15,11 @@ defmodule ShopifyClient.Telemetry do
       * Metadata: `:shop`, `:cause` (`:budget` when the local budget was
         short before sending, `:throttled` when Shopify answered `THROTTLED`).
 
+    * `[:shopify_client, :retry]` - a query is about to be retried after a
+      transport error or 5xx (only with `:query_retries`; never mutations).
+      * Measurements: `:delay_ms`.
+      * Metadata: `:shop`, `:reason` (`:transport` or `:server_error`).
+
     * `[:shopify_client, :deprecated]` - Shopify flagged the request as using
       a deprecated API (the `X-Shopify-API-Deprecated-Reason` header).
       * Metadata: `:shop`, `:reason`.

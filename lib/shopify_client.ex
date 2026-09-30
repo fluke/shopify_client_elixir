@@ -20,6 +20,29 @@ defmodule ShopifyClient do
       default: 10,
       doc: "Points a request is assumed to need when checking the budget before sending."
     ],
+    reserve: [
+      type: :non_neg_integer,
+      default: 0,
+      doc:
+        "Points to leave in the shop's bucket for others sharing it (another app or " <>
+          "service using the same shop's API budget). A request is only sent when the " <>
+          "estimated budget covers `:cost_hint` plus this."
+    ],
+    timeout: [
+      type: :pos_integer,
+      doc:
+        "One deadline, in ms, for every stage of a request: connecting, waiting for a " <>
+          "pooled connection, and receiving the response. Unset: Req's defaults. Doesn't " <>
+          "apply to bulk-result downloads, which can legitimately take much longer."
+    ],
+    query_retries: [
+      type: :non_neg_integer,
+      default: 0,
+      doc:
+        "How many times a *query* is retried after a transport error or a 5xx response, " <>
+          "with backoff (100ms, doubling, at most 2s). Mutations are never retried: after " <>
+          "those errors they may already have run."
+    ],
     user_errors: [
       type: {:in, [:error, :ignore]},
       default: :error,
@@ -199,7 +222,11 @@ defmodule ShopifyClient do
       url: "/graphql.json",
       # Throttling is handled by query/4. Req's own retries could resend a
       # mutation after a transport error, when it may already have run.
-      retry: false
+      retry: false,
+      # The response is decoded here (see decode_json/1), not by Req: Req's
+      # decoder turns an undecodable body, like a 502's HTML or plain text,
+      # into a request error that loses the HTTP status.
+      decode_body: false
     )
     |> Req.Request.put_header("user-agent", user_agent(opts[:app_name]))
     # The token lives in a closure, added as a header only at send time, so
@@ -229,7 +256,7 @@ defmodule ShopifyClient do
     }
 
     :telemetry.span([:shopify_client, :query], metadata, fn ->
-      result = run(client, client.shop, %{query: query, variables: variables}, opts, 0)
+      result = run(client, client.shop, %{query: query, variables: variables}, opts)
       {result, Map.merge(metadata, result_metadata(result))}
     end)
   end
@@ -269,37 +296,67 @@ defmodule ShopifyClient do
 
   # -- running a request ----------------------------------------------------------
 
-  defp run(client, shop, body, opts, attempt) do
-    with :ok <- await_budget(shop, opts[:cost_hint], opts) do
-      send_and_retry(client, shop, body, opts, attempt)
+  defp run(client, shop, body, opts) do
+    with :ok <- await_budget(shop, opts[:cost_hint] + opts[:reserve], opts) do
+      attempt(client, shop, body, opts, %{throttled: 0, transient: 0})
     end
   end
 
-  defp send_and_retry(client, shop, body, opts, attempt) do
+  defp attempt(client, shop, body, opts, tries) do
     case send_request(client, shop, body, opts) do
       {:error, %Error{reason: :throttled} = error} ->
-        retry_throttled(client, shop, body, opts, attempt, error)
+        retry_throttled(client, shop, body, opts, tries, error)
+
+      {:error, %Error{reason: reason} = error} when reason in [:transport, :server_error] ->
+        retry_transient(client, shop, body, opts, tries, error)
 
       result ->
         result
     end
   end
 
-  # Waits until the query's requested cost is back, then resends directly: the
-  # wait already accounts for the budget, so it isn't checked again.
-  defp retry_throttled(client, shop, body, opts, attempt, error) do
-    needed = (error.cost && error.cost.requested) || opts[:cost_hint]
+  # Waits until the query's requested cost (plus the reserve) is back, then
+  # resends directly: the wait already accounts for the budget, so it isn't
+  # checked again.
+  defp retry_throttled(client, shop, body, opts, tries, error) do
+    needed = ((error.cost && error.cost.requested) || opts[:cost_hint]) + opts[:reserve]
     wait = Budget.wait_ms(shop, needed)
 
-    if opts[:throttle] == :wait and attempt < opts[:max_throttle_retries] and
+    if opts[:throttle] == :wait and tries.throttled < opts[:max_throttle_retries] and
          wait <= opts[:max_wait] do
       throttle_event(shop, wait, :throttled)
       opts[:sleep].(wait)
-      send_and_retry(client, shop, body, opts, attempt + 1)
+      attempt(client, shop, body, opts, %{tries | throttled: tries.throttled + 1})
     else
       {:error, error}
     end
   end
+
+  # A transport error or 5xx may have happened after Shopify ran the operation,
+  # so only queries (which change nothing) are retried, and only on request.
+  defp retry_transient(client, shop, body, opts, tries, error) do
+    if tries.transient < opts[:query_retries] and query_operation?(body.query) do
+      delay = min(100 * Integer.pow(2, tries.transient), 2_000)
+
+      :telemetry.execute([:shopify_client, :retry], %{delay_ms: delay}, %{
+        shop: shop,
+        reason: error.reason
+      })
+
+      opts[:sleep].(delay)
+      attempt(client, shop, body, opts, %{tries | transient: tries.transient + 1})
+    else
+      {:error, error}
+    end
+  end
+
+  # A document is a mutation (or subscription) only when it says so; an
+  # anonymous `{ ... }` or `query ...` is a query. Leading `#` comments are
+  # skipped.
+  @mutation ~r/\A(?:\s|#[^\n]*(?:\n|\z))*(?:mutation|subscription)\b/
+
+  @doc false
+  def query_operation?(document), do: not Regex.match?(@mutation, document)
 
   # Before sending: is the shop's bucket (as far as we know) too low?
   defp await_budget(shop, points, opts) do
@@ -326,8 +383,9 @@ defmodule ShopifyClient do
   end
 
   defp send_request(%__MODULE__{req: req}, shop, body, opts) do
-    case Req.request(req, json: body) do
+    case Req.request(req, [json: body] ++ timeout_options(req, opts[:timeout])) do
       {:ok, response} ->
+        response = decode_json(response)
         cost = Cost.from_body(response.body)
         Budget.record(shop, cost)
         warn_if_deprecated(response, shop)
@@ -343,6 +401,26 @@ defmodule ShopifyClient do
            message: Exception.message(exception)
          }}
     end
+  end
+
+  # A JSON body becomes a map; anything else (an HTML error page, plain text)
+  # stays a binary, and the status decides what went wrong.
+  defp decode_json(%Req.Response{body: body} = response) when is_binary(body) do
+    case Jason.decode(body) do
+      {:ok, decoded} -> %{response | body: decoded}
+      {:error, _not_json} -> response
+    end
+  end
+
+  defp decode_json(response), do: response
+
+  defp timeout_options(_req, nil), do: []
+
+  # Merged into, not over, any connect_options the client was built with
+  # (a proxy, say): a per-request connect_options would replace them.
+  defp timeout_options(req, timeout) do
+    connect_options = Keyword.put(req.options[:connect_options] || [], :timeout, timeout)
+    [receive_timeout: timeout, pool_timeout: timeout, connect_options: connect_options]
   end
 
   # -- response handling ------------------------------------------------------------

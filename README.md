@@ -70,8 +70,21 @@ ShopifyClient.query(client, query, vars, throttle: :fail_fast)
 ```
 
 A throttled request never ran, so `ShopifyClient.Error.retry_safe?/1` is
-true for it. Transport errors and 5xx responses are not retried, because the
-operation may already have run.
+true for it. Transport errors and 5xx responses are not retried by default,
+because the operation may already have run.
+
+```elixir
+ShopifyClient.new(
+  shop: ..., access_token: ..., api_version: "2026-04",
+  # One deadline for connecting, pool checkout and the response.
+  timeout: 2_000,
+  # Leave 500 points of the shop's budget to others sharing it (another app or
+  # service using the same shop).
+  reserve: 500,
+  # Retry *queries* (never mutations) after a network error or 5xx.
+  query_retries: 2
+)
+```
 
 ### Errors
 
